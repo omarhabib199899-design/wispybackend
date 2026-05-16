@@ -78,6 +78,20 @@ const BotSchema = new mongoose.Schema(
       },
     },
 
+    // ── Meeting booking settings ──────────────────────────────────────────────
+    meetingBooking: {
+      enabled: { type: Boolean, default: false },
+      duration: { type: Number, default: 30 }, // minutes
+      availableHours: { type: String, default: "9am - 5pm" },
+      availableDays: { type: String, default: "Monday - Friday" },
+      confirmationMsg: {
+        type: String,
+        default:
+          "Your meeting has been booked! You'll receive a confirmation shortly.",
+      },
+      timezone: { type: String, default: "UTC" },
+    },
+
     // ── Allowed domains ───────────────────────────────────────────────────────
     allowedDomains: [{ type: String }], // e.g. ['example.com', 'www.example.com']
 

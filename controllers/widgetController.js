@@ -3,8 +3,10 @@ const ErrorResponse = require('../utils/ErrorResponse');
 const Bot           = require('../models/Bot');
 const Conversation  = require('../models/Conversation');
 const Lead          = require('../models/Lead');
+const Meeting       = require('../models/Meeting');
 const User          = require('../models/User');
-const { generateResponse, detectLeadInfo, summarizeConversation } = require('../services/aiService');
+const { generateResponse, detectLeadInfo, detectMeetingIntent, summarizeConversation } = require('../services/aiService');
+const calendarSvc   = require('../services/googleCalendarService');
 const { sendLeadNotification } = require('../services/emailService');
 const { v4: uuidv4 } = require('uuid');
 
@@ -42,8 +44,6 @@ const getOrCreateSession = async (botId, sessionId, visitorInfo) => {
 };
 
 // @route  POST /api/widget/init  (public)
-// Called when widget loads on a page — returns welcome message + session.
-// Persists the session so history survives page reloads.
 exports.initWidget = asyncHandler(async (req, res, next) => {
   const { botId, sessionId, visitorInfo = {} } = req.body;
   if (!botId) return next(new ErrorResponse('botId is required', 400));
@@ -54,7 +54,6 @@ exports.initWidget = asyncHandler(async (req, res, next) => {
   const owner = await User.findById(bot.user);
   if (!owner || !owner.isActive) return next(new ErrorResponse('Service unavailable', 503));
 
-  // ── Domain restriction check (mirrors the check in sendMessage) ────────────
   if (bot.allowedDomains.length > 0 && visitorInfo.page) {
     try {
       const pageHostname = new URL(visitorInfo.page).hostname.replace(/^www\./, '');
@@ -63,10 +62,9 @@ exports.initWidget = asyncHandler(async (req, res, next) => {
         return pageHostname === clean || pageHostname.endsWith('.' + clean);
       });
       if (!allowed) return next(new ErrorResponse('Domain not allowed', 403));
-    } catch (_) { /* invalid URL — allow through */ }
+    } catch (_) {}
   }
 
-  // Reuse existing session or create a new one
   let session = sessionId ? await Conversation.findOne({ sessionId }) : null;
 
   if (!session) {
@@ -99,19 +97,19 @@ exports.initWidget = asyncHandler(async (req, res, next) => {
       welcomeMessage: bot.welcomeMessage,
       theme:          bot.theme,
       leadCapture:    bot.leadCapture,
+      meetingBooking: bot.meetingBooking,
     },
   });
 });
 
 // @route  POST /api/widget/message  (public)
-// Core chat endpoint — processes user message and returns AI response
 exports.sendMessage = asyncHandler(async (req, res, next) => {
   const { botId, sessionId, message, visitorInfo = {} } = req.body;
-  if (!botId)    return next(new ErrorResponse('botId is required', 400));
+  if (!botId)           return next(new ErrorResponse('botId is required', 400));
   if (!message?.trim()) return next(new ErrorResponse('message is required', 400));
-  if (!sessionId) return next(new ErrorResponse('sessionId is required', 400));
+  if (!sessionId)       return next(new ErrorResponse('sessionId is required', 400));
   if (message.length > 2000) return next(new ErrorResponse('Message too long', 400));
-  // Sanitize: strip HTML/script tags to prevent XSS in dashboard rendering
+
   const sanitizedMessage = message.replace(/<[^>]*>/g, '').trim();
 
   const bot = await Bot.findOne({ botId, isActive: true, isDeleted: false });
@@ -120,7 +118,6 @@ exports.sendMessage = asyncHandler(async (req, res, next) => {
   const owner = await User.findById(bot.user);
   if (!owner) return next(new ErrorResponse('Service unavailable', 503));
 
-  // Domain restriction check — widget sends visitorInfo.page (full URL)
   if (bot.allowedDomains.length > 0 && visitorInfo.page) {
     try {
       const pageHostname = new URL(visitorInfo.page).hostname.replace(/^www\./, '');
@@ -129,13 +126,9 @@ exports.sendMessage = asyncHandler(async (req, res, next) => {
         return pageHostname === clean || pageHostname.endsWith('.' + clean);
       });
       if (!allowed) return next(new ErrorResponse('Domain not allowed', 403));
-    } catch (_) { /* invalid URL — allow through */ }
+    } catch (_) {}
   }
 
-  // Rate limit per botId to protect quota across IPs
-  // (IP-level rate limiting already applied by widgetLimit middleware)
-
-  // Check / create session — normally already created by /init, but handle direct calls too
   let session = await Conversation.findOne({ sessionId });
   if (!session) {
     const canChat = await owner.canConverse();
@@ -150,7 +143,6 @@ exports.sendMessage = asyncHandler(async (req, res, next) => {
       messages: [],
     });
 
-    // Only increment counters here if session wasn't created by /init
     owner.usage.conversationsThisMonth += 1;
     bot.stats.totalConversations       += 1;
     await Promise.all([
@@ -159,13 +151,154 @@ exports.sendMessage = asyncHandler(async (req, res, next) => {
     ]);
   }
 
-  // Add user message to session (use sanitized content)
   session.messages.push({ role: 'user', content: sanitizedMessage });
   bot.stats.totalMessages += 1;
 
+  // ── Meeting booking intent detection ────────────────────────────────────────
+  let meetingBooked    = false;
+  let meetingDetails   = null;
+
+  if (bot.meetingBooking?.enabled && !session.meetingBooked) {
+    try {
+      const recentText = session.messages.slice(-10)
+        .map(m => `${m.role === 'user' ? 'User' : 'Bot'}: ${m.content}`)
+        .join('\n');
+
+      const intent = await detectMeetingIntent(recentText);
+
+      if (intent.wantsBooking) {
+        // Check if we have enough info to book
+        const hasName      = intent.name  || session.collectedInfo?.name;
+        const hasEmail     = intent.email || session.collectedInfo?.email;
+        const hasDateOrTime = intent.preferredDate || intent.preferredTime;
+
+        // Store partial info in session for multi-turn collection
+        if (!session.collectedInfo) session.collectedInfo = {};
+        if (intent.name)          session.collectedInfo.name          = intent.name;
+        if (intent.email)         session.collectedInfo.email         = intent.email;
+        if (intent.preferredDate) session.collectedInfo.preferredDate = intent.preferredDate;
+        if (intent.preferredTime) session.collectedInfo.preferredTime = intent.preferredTime;
+        if (intent.topic)         session.collectedInfo.topic         = intent.topic;
+
+        const info = session.collectedInfo;
+
+        if (info.name && info.email && (info.preferredDate || info.preferredTime)) {
+          // We have enough — book the meeting
+          try {
+            // Parse a rough start time from natural language
+            const startTime = parseMeetingTime(info.preferredDate, info.preferredTime);
+            const duration  = bot.meetingBooking.duration || 30;
+            const endTime   = new Date(startTime.getTime() + duration * 60000);
+
+            const meeting = await Meeting.create({
+              user:        bot.user,
+              bot:         bot._id,
+              conversation: session._id,
+              guestName:   info.name,
+              guestEmail:  info.email,
+              title:       info.topic ? `Meeting: ${info.topic}` : `Meeting with ${info.name}`,
+              description: info.topic || '',
+              startTime,
+              endTime,
+              duration,
+              timezone:    bot.meetingBooking.timezone || owner.timezone || 'UTC',
+            });
+
+            // Push to Google Calendar if connected
+            const ownerWithTokens = await User.findById(bot.user).select('+googleCalendarTokens');
+            if (ownerWithTokens.googleCalendarConnected && ownerWithTokens.googleCalendarTokens) {
+              try {
+                const event = await calendarSvc.createEvent(ownerWithTokens.googleCalendarTokens, {
+                  title:       meeting.title,
+                  description: meeting.description,
+                  startTime:   meeting.startTime,
+                  endTime:     meeting.endTime,
+                  guestEmail:  meeting.guestEmail,
+                  guestName:   meeting.guestName,
+                  timezone:    meeting.timezone,
+                });
+                meeting.googleEventId  = event.eventId;
+                meeting.googleMeetLink = event.meetLink;
+                meeting.calendarLink   = event.htmlLink;
+                await meeting.save();
+              } catch (err) {
+                console.error('Google Calendar booking failed:', err.message);
+              }
+            }
+
+            session.meetingBooked   = true;
+            meetingBooked           = true;
+            meetingDetails          = meeting;
+
+          } catch (err) {
+            console.error('Meeting creation error:', err.message);
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Meeting intent detection error:', err.message);
+    }
+  }
+
+  // ── Build system prompt — inject meeting instructions if enabled ────────────
+  let systemPrompt = bot.buildSystemPrompt();
+
+  if (bot.meetingBooking?.enabled && !session.meetingBooked) {
+    systemPrompt += `\n\nMEETING BOOKING: You can schedule meetings for this business.
+Available hours: ${bot.meetingBooking.availableHours || '9am - 5pm'}
+Available days: ${bot.meetingBooking.availableDays || 'Monday - Friday'}
+Duration: ${bot.meetingBooking.duration || 30} minutes
+
+If the user wants to book a meeting/call/appointment/demo:
+1. Ask for their name (if not given)
+2. Ask for their email (if not given)
+3. Ask for their preferred date and time
+4. Once you have all three, confirm the booking details back to them naturally.
+Do NOT say "I'll book it now" — just collect the info naturally in conversation.`;
+  }
+
+  if (meetingBooked && meetingDetails) {
+    // Override AI response with confirmation
+    const confirmMsg = bot.meetingBooking?.confirmationMsg ||
+      "Your meeting has been booked! You'll receive a confirmation shortly.";
+
+    const startFormatted = meetingDetails.startTime.toLocaleDateString('en-US', {
+      weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    });
+    const timeFormatted = meetingDetails.startTime.toLocaleTimeString('en-US', {
+      hour: '2-digit', minute: '2-digit',
+    });
+
+    const aiContent = `${confirmMsg}\n\n📅 **${meetingDetails.title}**\n📆 ${startFormatted} at ${timeFormatted}\n⏱ ${meetingDetails.duration} minutes${meetingDetails.googleMeetLink ? `\n🎥 [Join Google Meet](${meetingDetails.googleMeetLink})` : ''}`;
+
+    session.messages.push({
+      role:    'assistant',
+      content: aiContent,
+      model:   'system',
+      tokens:  0,
+      latency: 0,
+    });
+
+    await session.save();
+    await bot.save({ validateBeforeSave: false });
+
+    return res.json({
+      success:       true,
+      message:       aiContent,
+      sessionId,
+      leadCaptured:  session.lead?.captured || false,
+      meetingBooked: true,
+      meeting: {
+        title:         meetingDetails.title,
+        startTime:     meetingDetails.startTime,
+        duration:      meetingDetails.duration,
+        googleMeetLink: meetingDetails.googleMeetLink,
+      },
+    });
+  }
+
   // ── Generate AI response ────────────────────────────────────────────────────
-  const systemPrompt = bot.buildSystemPrompt();
-  const history      = session.messages.slice(-20); // last 20 messages for context
+  const history = session.messages.slice(-20);
 
   let aiResult;
   try {
@@ -183,7 +316,6 @@ exports.sendMessage = asyncHandler(async (req, res, next) => {
     };
   }
 
-  // Add assistant message
   session.messages.push({
     role:    'assistant',
     content: aiResult.content,
@@ -192,12 +324,11 @@ exports.sendMessage = asyncHandler(async (req, res, next) => {
     latency: aiResult.latency,
   });
 
-  session.totalTokens += aiResult.tokens;
+  session.totalTokens = (session.totalTokens || 0) + aiResult.tokens;
 
   // ── Lead detection ──────────────────────────────────────────────────────────
-  // Check after every 2nd user message if lead info was shared
   const userMessages = session.messages.filter(m => m.role === 'user');
-  if (!session.lead.captured && userMessages.length % 2 === 0) {
+  if (!session.lead?.captured && userMessages.length % 2 === 0) {
     try {
       const convoText = session.messages.slice(-8)
         .map(m => `${m.role === 'user' ? 'User' : 'Bot'}: ${m.content}`)
@@ -207,14 +338,13 @@ exports.sendMessage = asyncHandler(async (req, res, next) => {
 
       if (leadInfo.hasLead && (leadInfo.email || leadInfo.phone)) {
         session.lead = {
-          captured:  true,
-          name:      leadInfo.name,
-          email:     leadInfo.email,
-          phone:     leadInfo.phone,
+          captured:   true,
+          name:       leadInfo.name,
+          email:      leadInfo.email,
+          phone:      leadInfo.phone,
           capturedAt: new Date(),
         };
 
-        // Save to Leads collection
         const lead = await Lead.create({
           bot:          bot._id,
           user:         bot.user,
@@ -226,14 +356,11 @@ exports.sendMessage = asyncHandler(async (req, res, next) => {
           source:       visitorInfo.page,
         });
 
-        // Update stats
-        bot.stats.totalLeads    += 1;
+        bot.stats.totalLeads       += 1;
         owner.usage.leadsThisMonth += 1;
 
-        // Send email notification to bot owner (async, don't await)
         sendLeadNotification(owner.email, lead, bot.name).catch(console.error);
 
-        // Generate summary async
         summarizeConversation(session.messages).then(summary => {
           if (summary) Lead.findByIdAndUpdate(lead._id, { summary }).exec();
         }).catch(() => {});
@@ -248,15 +375,77 @@ exports.sendMessage = asyncHandler(async (req, res, next) => {
   await owner.save({ validateBeforeSave: false });
 
   res.json({
-    success: true,
-    message: aiResult.content,
+    success:      true,
+    message:      aiResult.content,
     sessionId,
-    leadCaptured: session.lead.captured,
+    leadCaptured: session.lead?.captured || false,
+    meetingBooked: false,
   });
 });
 
+// ── Helper: parse natural language date/time into a Date object ──────────────
+function parseMeetingTime(preferredDate, preferredTime) {
+  const now  = new Date();
+  let date   = new Date(now);
+
+  if (preferredDate) {
+    const d = preferredDate.toLowerCase();
+    if (d.includes('tomorrow')) {
+      date.setDate(date.getDate() + 1);
+    } else if (d.includes('monday'))    { date = nextWeekday(0, 1); }
+    else if (d.includes('tuesday'))     { date = nextWeekday(0, 2); }
+    else if (d.includes('wednesday'))   { date = nextWeekday(0, 3); }
+    else if (d.includes('thursday'))    { date = nextWeekday(0, 4); }
+    else if (d.includes('friday'))      { date = nextWeekday(0, 5); }
+    else if (d.includes('saturday'))    { date = nextWeekday(0, 6); }
+    else if (d.includes('sunday'))      { date = nextWeekday(0, 0); }
+    else {
+      // Try native Date parsing
+      const parsed = new Date(preferredDate);
+      if (!isNaN(parsed)) date = parsed;
+      else date.setDate(date.getDate() + 1); // fallback: tomorrow
+    }
+  } else {
+    date.setDate(date.getDate() + 1); // fallback: tomorrow
+  }
+
+  // Set time
+  if (preferredTime) {
+    const t = preferredTime.toLowerCase();
+    if (t.includes('morning'))              { date.setHours(9, 0, 0, 0); }
+    else if (t.includes('afternoon'))       { date.setHours(14, 0, 0, 0); }
+    else if (t.includes('evening'))         { date.setHours(17, 0, 0, 0); }
+    else {
+      // Try to parse "3pm", "10am", "14:00" etc.
+      const match = t.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
+      if (match) {
+        let hours   = parseInt(match[1]);
+        const mins  = parseInt(match[2] || '0');
+        const ampm  = match[3];
+        if (ampm === 'pm' && hours < 12) hours += 12;
+        if (ampm === 'am' && hours === 12) hours = 0;
+        date.setHours(hours, mins, 0, 0);
+      } else {
+        date.setHours(10, 0, 0, 0); // fallback: 10am
+      }
+    }
+  } else {
+    date.setHours(10, 0, 0, 0); // fallback: 10am
+  }
+
+  return date;
+}
+
+function nextWeekday(fromOffset, targetDay) {
+  const date = new Date();
+  date.setDate(date.getDate() + fromOffset);
+  const current = date.getDay();
+  const diff    = (targetDay - current + 7) % 7 || 7;
+  date.setDate(date.getDate() + diff);
+  return date;
+}
+
 // @route  POST /api/widget/end  (public)
-// Called when visitor closes chat
 exports.endSession = asyncHandler(async (req, res, next) => {
   const { sessionId, rating } = req.body;
   if (!sessionId) return next(new ErrorResponse('sessionId is required', 400));
@@ -264,8 +453,8 @@ exports.endSession = asyncHandler(async (req, res, next) => {
   const session = await Conversation.findOne({ sessionId });
   if (!session) return res.json({ success: true });
 
-  session.status  = 'ended';
-  session.endedAt = new Date();
+  session.status   = 'ended';
+  session.endedAt  = new Date();
   session.duration = Math.round((new Date() - session.createdAt) / 1000);
   if (rating && rating >= 1 && rating <= 5) session.rating = rating;
 
@@ -290,7 +479,7 @@ exports.getConversations = asyncHandler(async (req, res) => {
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(parseInt(limit))
-      .select('-messages'), // exclude message content in list view
+      .select('-messages'),
     Conversation.countDocuments(filter),
   ]);
 
@@ -320,15 +509,11 @@ exports.deleteConversation = asyncHandler(async (req, res, next) => {
 });
 
 // @route  POST /api/widget/lead  (public)
-// Structured lead capture — called by the widget lead form directly.
-// Accepts { sessionId, name, email, phone } and saves without AI detection,
-// eliminating false positives from natural conversation messages.
 exports.captureLead = asyncHandler(async (req, res, next) => {
   const { sessionId, name, email, phone } = req.body;
   if (!sessionId)       return next(new ErrorResponse('sessionId is required', 400));
   if (!email && !phone) return next(new ErrorResponse('email or phone is required', 400));
 
-  // Basic email format check
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return next(new ErrorResponse('Invalid email address', 400));
   }
@@ -336,7 +521,6 @@ exports.captureLead = asyncHandler(async (req, res, next) => {
   const session = await Conversation.findOne({ sessionId });
   if (!session) return next(new ErrorResponse('Session not found', 404));
 
-  // Don't double-capture
   if (session.lead?.captured) {
     return res.json({ success: true, message: 'Lead already captured' });
   }
@@ -357,7 +541,7 @@ exports.captureLead = asyncHandler(async (req, res, next) => {
     source:       session.visitor?.page,
   });
 
-  bot.stats.totalLeads    += 1;
+  bot.stats.totalLeads       += 1;
   owner.usage.leadsThisMonth += 1;
 
   await Promise.all([
@@ -366,7 +550,6 @@ exports.captureLead = asyncHandler(async (req, res, next) => {
     owner.save({ validateBeforeSave: false }),
   ]);
 
-  // Async: notify + summarize
   sendLeadNotification(owner.email, lead, bot.name).catch(console.error);
   summarizeConversation(session.messages).then(summary => {
     if (summary) Lead.findByIdAndUpdate(lead._id, { summary }).exec();

@@ -94,6 +94,57 @@ ${conversationText}`;
 };
 
 /**
+ * Detect if the conversation contains a meeting booking request.
+ * Also extracts any booking details already shared.
+ * Returns {
+ *   wantsBooking: bool,
+ *   name: string|null,
+ *   email: string|null,
+ *   preferredDate: string|null,   // e.g. "tomorrow", "Monday", "May 20"
+ *   preferredTime: string|null,   // e.g. "3pm", "morning"
+ *   topic: string|null,
+ * }
+ */
+exports.detectMeetingIntent = async (conversationText) => {
+  const prompt = `Analyze this chat conversation. Determine if the user wants to schedule, book, or arrange a meeting, call, appointment, or demo.
+
+Return ONLY valid JSON in this exact format (use null for missing fields):
+{
+  "wantsBooking": true/false,
+  "name": "string or null",
+  "email": "string or null",
+  "preferredDate": "string or null",
+  "preferredTime": "string or null",
+  "topic": "one sentence about what the meeting is for, or null"
+}
+
+Examples that mean wantsBooking=true:
+- "I want to book a call"
+- "Can we schedule a demo?"
+- "I'd like to set up a meeting"
+- "When can we talk?"
+- "Book an appointment"
+- "I want to speak to someone"
+
+Conversation:
+${conversationText}`;
+
+  try {
+    const res = await groq.chat.completions.create({
+      model:       GROQ_MODEL,
+      messages:    [{ role: 'user', content: prompt }],
+      temperature: 0,
+      max_tokens:  200,
+    });
+    const text    = res.choices[0].message.content.trim();
+    const cleaned = text.replace(/```json|```/g, '').trim();
+    return JSON.parse(cleaned);
+  } catch (_) {
+    return { wantsBooking: false, name: null, email: null, preferredDate: null, preferredTime: null, topic: null };
+  }
+};
+
+/**
  * Generate a short summary of a conversation (for leads page).
  */
 exports.summarizeConversation = async (messages) => {

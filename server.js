@@ -122,6 +122,7 @@ app.use("/api/leads", require("./routes/leadRoutes"));
 app.use("/api/analytics", require("./routes/analyticsRoutes"));
 app.use("/api/admin", require("./routes/adminRoutes"));
 app.use("/api/billing", require("./routes/billingRoutes"));
+app.use("/api/meetings", require("./routes/meetingRoutes"));
 
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((req, res) =>

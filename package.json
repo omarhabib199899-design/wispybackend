@@ -29,7 +29,8 @@
     "openai": "^4.52.3",
     "resend": "^6.12.3",
     "stripe": "^16.2.0",
-    "uuid": "^10.0.0"
+    "uuid": "^10.0.0",
+    "googleapis": "^140.0.0"
   },
   "devDependencies": {
     "jest": "^29.7.0",
