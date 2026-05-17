@@ -71,7 +71,15 @@ const dashboardCors = cors({
 
 // Apply open CORS only to public widget routes, then restricted CORS everywhere else
 app.use("/api/widget", widgetCors);
-app.use(dashboardCors);
+app.use("/api/widget", widgetCors);
+app.use("/api/auth", dashboardCors);
+app.use("/api/bots", dashboardCors);
+app.use("/api/conversations", dashboardCors);
+app.use("/api/leads", dashboardCors);
+app.use("/api/analytics", dashboardCors);
+app.use("/api/admin", dashboardCors);
+app.use("/api/billing", dashboardCors);
+app.use("/api/meetings", dashboardCors);
 
 // ── Serve widget.js publicly (any site can load it) ───────────────────────────
 const path = require("path");
