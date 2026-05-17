@@ -176,7 +176,11 @@ UserSchema.methods.canConverse = async function () {
       // Subscription fully expired — fall through to trial limits
     } else {
       const max = this.getPlanConfig()?.maxConversationsPerMonth;
-      return max === Infinity || this.usage.conversationsThisMonth < max;
+      return (
+        max === null ||
+        max === Infinity ||
+        this.usage.conversationsThisMonth < max
+      );
     }
   }
 
